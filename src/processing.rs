@@ -45,6 +45,7 @@ fn forward_to_playback(tx_pb: &crossbeam_channel::Sender<AudioMessage>, msg: Aud
 /// Spawn the processing thread: builds the pipeline, runs the chunk loop, and handles config updates.
 pub fn run_processing(
     conf_proc: config::Configuration,
+    device_group: usize,
     barrier_proc: Arc<Barrier>,
     tx_pb: crossbeam_channel::Sender<AudioMessage>,
     rx_cap: crossbeam_channel::Receiver<AudioMessage>,
@@ -56,6 +57,7 @@ pub fn run_processing(
         .spawn(move || {
             processing(
                 conf_proc,
+                device_group,
                 barrier_proc,
                 tx_pb,
                 rx_cap,
@@ -68,16 +70,18 @@ pub fn run_processing(
 
 fn processing(
     conf_proc: config::Configuration,
+    device_group: usize,
     barrier_proc: Arc<Barrier>,
     tx_pb: crossbeam_channel::Sender<AudioMessage>,
     rx_cap: crossbeam_channel::Receiver<AudioMessage>,
     rx_pipeconf: crossbeam_channel::Receiver<(config::ConfigChange, config::Configuration)>,
     processing_params: Arc<ProcessingParameters>,
 ) {
-    let chunksize = conf_proc.devices.chunksize;
-    let samplerate = conf_proc.devices.samplerate;
-    let multithreaded = conf_proc.devices.multithreaded();
-    let nbr_threads = conf_proc.devices.worker_threads();
+    let devices = conf_proc.devices.group(device_group);
+    let chunksize = devices.chunksize;
+    let samplerate = devices.samplerate;
+    let multithreaded = devices.multithreaded();
+    let nbr_threads = devices.worker_threads();
     let hw_threads = std::thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or_default();
@@ -102,6 +106,7 @@ fn processing(
         build_processing_threadpool(multithreaded, nbr_threads, chunksize, samplerate);
     let mut pipeline = pipeline::Pipeline::from_config(
         conf_proc,
+        device_group,
         processing_params.clone(),
         processing_pool.clone(),
     );
@@ -169,6 +174,7 @@ fn processing(
                     processing_params.sync_volumes_to_target();
                     let new_pipeline = pipeline::Pipeline::from_config(
                         new_config,
+                        device_group,
                         processing_params.clone(),
                         processing_pool.clone(),
                     );

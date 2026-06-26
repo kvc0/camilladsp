@@ -163,7 +163,7 @@ fn build_pipeline(chunksize: usize, multithreaded: bool, with_conv: bool) -> Pip
     let conf = config::Configuration {
         title: None,
         description: None,
-        devices: config::Devices {
+        devices: config::DeviceGroups(vec![config::Devices {
             samplerate: 48000,
             chunksize,
             queuelimit: None,
@@ -193,7 +193,7 @@ fn build_pipeline(chunksize: usize, multithreaded: bool, with_conv: bool) -> Pip
             volume_limit: None,
             multithreaded: Some(multithreaded),
             worker_threads: None,
-        },
+        }]),
         mixers: Some(mixers),
         filters: Some(filters),
         processors: None,
@@ -216,16 +216,17 @@ fn build_pipeline(chunksize: usize, multithreaded: bool, with_conv: bool) -> Pip
                 bypassed: Some(false),
             }),
         ]),
+        pipelines: None,
     };
 
     let processing_params = Arc::new(ProcessingParameters::new(&[0.0_f32; 5], &[false; 5]));
     let filter_pool = camillalib::processing::build_processing_threadpool(
         multithreaded,
-        conf.devices.worker_threads(),
-        conf.devices.chunksize,
-        conf.devices.samplerate,
+        conf.devices.group(0).worker_threads(),
+        conf.devices.group(0).chunksize,
+        conf.devices.group(0).samplerate,
     );
-    Pipeline::from_config(conf, processing_params, filter_pool)
+    Pipeline::from_config(conf, 0, processing_params, filter_pool)
 }
 
 fn make_chunk(channels: usize, frames: usize) -> AudioChunk {

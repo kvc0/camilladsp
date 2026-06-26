@@ -200,14 +200,20 @@ impl Pipeline {
     /// `None` means single-threaded processing.
     pub fn from_config(
         conf: config::Configuration,
+        device_group: usize,
         processing_params: Arc<ProcessingParameters>,
         filter_pool: Option<Arc<rayon::ThreadPool>>,
     ) -> Self {
-        debug!("Build new pipeline");
-        trace!("Pipeline config {:?}", conf.pipeline);
+        debug!("Build new pipeline for device group {device_group}");
+        let devices = conf.devices.group(device_group);
+        let steps_for_group: Vec<config::PipelineStep> = conf
+            .chain_for_group(device_group)
+            .cloned()
+            .unwrap_or_default();
+        trace!("Pipeline config {steps_for_group:?}");
         let mut steps = Vec::<PipelineStep>::new();
-        let mut num_channels = conf.devices.capture.channels();
-        for step in conf.pipeline.unwrap_or_default() {
+        let mut num_channels = devices.capture.channels();
+        for step in steps_for_group {
             match step {
                 config::PipelineStep::Mixer(step) => {
                     if !step.is_bypassed() {
@@ -243,8 +249,8 @@ impl Pipeline {
                                 channel,
                                 &step.names,
                                 conf.filters.as_ref().unwrap().clone(),
-                                conf.devices.chunksize,
-                                conf.devices.samplerate,
+                                devices.chunksize,
+                                devices.samplerate,
                                 processing_params.clone(),
                             );
                             steps.push(PipelineStep::FilterStep(fltgrp));
@@ -260,8 +266,8 @@ impl Pipeline {
                                 let comp = processors::compressor::Compressor::from_config(
                                     &step.name,
                                     parameters,
-                                    conf.devices.samplerate,
-                                    conf.devices.chunksize,
+                                    devices.samplerate,
+                                    devices.chunksize,
                                 );
                                 Box::new(comp) as Box<dyn Processor>
                             }
@@ -269,8 +275,8 @@ impl Pipeline {
                                 let gate = processors::noisegate::NoiseGate::from_config(
                                     &step.name,
                                     parameters,
-                                    conf.devices.samplerate,
-                                    conf.devices.chunksize,
+                                    devices.samplerate,
+                                    devices.chunksize,
                                 );
                                 Box::new(gate) as Box<dyn Processor>
                             }
@@ -278,7 +284,7 @@ impl Pipeline {
                                 let race = processors::race::RACE::from_config(
                                     &step.name,
                                     parameters,
-                                    conf.devices.samplerate,
+                                    devices.samplerate,
                                 );
                                 Box::new(race) as Box<dyn Processor>
                             }
@@ -292,21 +298,21 @@ impl Pipeline {
         let mute = processing_params.is_mute(0);
         let volume = filters::basicfilters::Volume::new(
             "default",
-            conf.devices.ramp_time(),
-            conf.devices.volume_limit(),
+            devices.ramp_time(),
+            devices.volume_limit(),
             current_volume,
             mute,
-            conf.devices.chunksize,
-            conf.devices.samplerate,
+            devices.chunksize,
+            devices.samplerate,
             processing_params.clone(),
             0,
         );
-        let secs_per_chunk = conf.devices.chunksize as f32 / conf.devices.samplerate as f32;
+        let secs_per_chunk = devices.chunksize as f32 / devices.samplerate as f32;
         // When a rayon pool is available, merge the per-channel filter
         // steps into parallel steps that run on it. With no pool the
         // filters run sequentially.
         if let Some(pool) = &filter_pool {
-            steps = parallelize_filters(&mut steps, conf.devices.capture.channels(), pool);
+            steps = parallelize_filters(&mut steps, devices.capture.channels(), pool);
         }
         Pipeline {
             steps,
@@ -487,14 +493,14 @@ devices:
     format: S16_LE
 ";
         let conf: crate::config::Configuration = yaml_serde::from_str(CONFIG).unwrap();
-        let chunksize = conf.devices.chunksize;
-        let channels = conf.devices.capture.channels();
+        let chunksize = conf.devices.group(0).chunksize;
+        let channels = conf.devices.group(0).capture.channels();
 
         let params = Arc::new(ProcessingParameters::default());
         params.set_target_volume(0, -100.0);
         params.sync_volumes_to_target();
 
-        let mut pipeline = Pipeline::from_config(conf, params, None);
+        let mut pipeline = Pipeline::from_config(conf, 0, params, None);
 
         let waveforms = vec![vec![1.0 as PrcFmt; chunksize]; channels];
         let chunk = AudioChunk::new(waveforms, 1.0, -1.0, chunksize, chunksize);

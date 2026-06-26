@@ -14,7 +14,6 @@
 // Mozilla Public License along with this program. If not, see
 // <https://www.gnu.org/licenses/> and <https://www.mozilla.org/MPL/2.0/>.
 
-use crossbeam_channel::select;
 use parking_lot::{Mutex, RwLockUpgradableReadGuard};
 use std::sync::Arc;
 #[cfg(any(windows, feature = "websocket"))]
@@ -68,18 +67,52 @@ pub struct EngineConfig {
     pub ws_pass: Option<String>,
 }
 
-/// Stop the pipeline after a fatal device event, record the stop reason, clear
+/// The event a supervisor `select` resolved to: either a controller command, or
+/// a status message from the pipeline at the given index.
+enum SupervisorEvent {
+    Control(Result<ControllerMessage, crossbeam_channel::RecvError>),
+    Status(usize, Result<StatusMessage, crossbeam_channel::RecvError>),
+}
+
+/// Stop every pipeline in the session: each tells its capture thread to exit,
+/// releases its startup barrier if it has not been met yet, and joins its
+/// threads. Drains `pipelines`, leaving it empty.
+fn stop_all_pipelines(pipelines: &mut Vec<EnginePipeline>) {
+    for pipeline in pipelines.drain(..) {
+        pipeline.stop();
+    }
+}
+
+/// Record readiness of `group`: release its startup barrier once both its
+/// capture and playback threads are ready, and once every group has been
+/// released, finish startup and clear the stop reason.
+fn note_group_ready(
+    group: usize,
+    pipelines: &mut [EnginePipeline],
+    is_starting: &mut bool,
+    status_structs: &StatusStructs,
+) {
+    if pipelines[group].release_barrier_if_ready()
+        && *is_starting
+        && pipelines.iter().all(|p| p.barrier_released())
+    {
+        debug!("All device groups ready, supervisor loop starts now!");
+        *is_starting = false;
+        crate::set_stop_reason(&status_structs.status, StopReason::None);
+    }
+}
+
+/// Stop all pipelines after a fatal device event, record the stop reason, clear
 /// the active config, and return [`ExitState::Restart`].
 fn fail_and_restart(
-    pipeline: EnginePipeline,
-    is_starting: bool,
     stop_reason: StopReason,
     active_config: config::Configuration,
     shared_configs: &SharedConfigs,
     status_structs: &StatusStructs,
+    pipelines: &mut Vec<EnginePipeline>,
 ) -> crate::Res<ExitState> {
     crate::set_stop_reason(&status_structs.status, stop_reason);
-    pipeline.stop(is_starting);
+    stop_all_pipelines(pipelines);
     {
         let mut active_cfg_shared = shared_configs.active.lock();
         let mut prev_cfg_shared = shared_configs.previous.lock();
@@ -91,7 +124,8 @@ fn fail_and_restart(
     Ok(ExitState::Restart)
 }
 
-/// Run one processing session: open devices, process audio, and return an [`ExitState`].
+/// Run one processing session: open devices for every device group, process
+/// audio, and return an [`ExitState`].
 pub fn run(
     shared_configs: SharedConfigs,
     status_structs: StatusStructs,
@@ -106,85 +140,128 @@ pub fn run(
         }
     };
 
-    let (mut pipeline, rx_status) = start_pipeline(&active_config, &status_structs);
+    // One independent capture -> processing -> playback pipeline per device
+    // group. Each gets its own channels and a 4-way startup barrier (capture,
+    // playback, processing, supervisor). The control channel (`rx_ctrl`) and the
+    // shared configs are global across all groups.
+    let num_groups = active_config.devices.len();
+    let mut pipelines: Vec<EnginePipeline> = Vec::with_capacity(num_groups);
+    for group in 0..num_groups {
+        // Group 0 reuses the process-lifetime status structs held by the
+        // WebSocket server; additional groups get fresh structs that share the
+        // global run status (stop reason).
+        let group_status = if group == 0 {
+            status_structs.clone()
+        } else {
+            status_structs.new_with_shared_run_status()
+        };
+        pipelines.push(start_pipeline(&active_config, group, group_status));
+    }
 
     loop {
-        // If startup procedure is not finished, do not process config change or exit
-        let ctrl_ch = if is_starting {
-            crossbeam_channel::never()
-        } else {
-            rx_ctrl.clone()
+        // Wait for a status message from any group, or (once startup is done) a
+        // controller command. A fresh selector is built each iteration because
+        // the set of receivers is dynamic (one status channel per group).
+        let event = {
+            let mut sel = crossbeam_channel::Select::new();
+            for pipeline in &pipelines {
+                sel.recv(pipeline.status_channel());
+            }
+            // Only accept controller commands once every group has started.
+            let ctrl_index = if is_starting {
+                None
+            } else {
+                Some(sel.recv(&rx_ctrl))
+            };
+            let oper = sel.select();
+            let index = oper.index();
+            if Some(index) == ctrl_index {
+                SupervisorEvent::Control(oper.recv(&rx_ctrl))
+            } else {
+                SupervisorEvent::Status(index, oper.recv(pipelines[index].status_channel()))
+            }
         };
-        select! {
-            recv(ctrl_ch) -> msg  => {
-                match msg {
-                    Ok(ControllerMessage::ConfigChanged(new_conf)) => {
-                        if !ctrl_ch.is_empty() {
-                            debug!("Dropping config change command since there are more commands in the queue");
-                            continue;
-                        }
-                        status_structs.processing.set_processing_load(0.0);
-                        status_structs.processing.set_resampler_load(0.0);
-                        let comp = config::config_diff(&active_config, &new_conf);
-                        match comp {
-                            config::ConfigChange::Pipeline
-                            | config::ConfigChange::MixerParameters
-                            | config::ConfigChange::FilterParameters { .. } => {
-                                pipeline.update_processing_config(comp, *new_conf.clone());
-                                active_config = *new_conf;
-                                *shared_configs.active.lock() = Some(active_config.clone());
-                                let used_channels = config::used_capture_channels(&active_config);
-                                debug!("Using channels {used_channels:?}");
-                                status_structs.capture.write().used_channels = used_channels;
-                                debug!("Sent changes to pipeline");
-                            }
-                            config::ConfigChange::Devices => {
-                                debug!("Devices changed, restart required.");
-                                pipeline.stop(is_starting);
-                                *shared_configs.active.lock() = Some(*new_conf);
-                                trace!("All threads stopped, returning");
-                                return Ok(ExitState::Restart);
-                            }
-                            config::ConfigChange::None => {
-                                debug!("No changes in config.");
-                            }
-                        };
-                    },
-                    Ok(ControllerMessage::Stop) => {
-                        debug!("Stop requested...");
-                        pipeline.stop(is_starting);
-                        {
-                            let mut active_cfg_shared = shared_configs.active.lock();
-                            let mut prev_cfg_shared = shared_configs.previous.lock();
-                            *active_cfg_shared = None;
-                            *prev_cfg_shared = Some(active_config);
-                        }
-                        trace!("All threads stopped, stopping");
-                        return Ok(ExitState::Restart);
-                    },
-                    Ok(ControllerMessage::Exit) => {
-                        debug!("Exit requested...");
-                        pipeline.stop(is_starting);
-                        *shared_configs.previous.lock() = Some(active_config);
-                        trace!("All threads stopped, exiting");
-                        return Ok(ExitState::Exit);
-                    },
-                    Err(err) => {
-                        return Err(Box::new(err));
+
+        match event {
+            SupervisorEvent::Control(msg) => match msg {
+                Ok(ControllerMessage::ConfigChanged(new_conf)) => {
+                    if !rx_ctrl.is_empty() {
+                        debug!(
+                            "Dropping config change command since there are more commands in the queue"
+                        );
+                        continue;
                     }
+                    for pipeline in &pipelines {
+                        pipeline.status().processing.set_processing_load(0.0);
+                        pipeline.status().processing.set_resampler_load(0.0);
+                    }
+                    let comp = config::config_diff(&active_config, &new_conf);
+                    match comp {
+                        config::ConfigChange::Pipeline
+                        | config::ConfigChange::MixerParameters
+                        | config::ConfigChange::FilterParameters { .. } => {
+                            // Every group's processing thread rebuilds its own
+                            // chain from the new config.
+                            for pipeline in &pipelines {
+                                pipeline
+                                    .update_processing_config(comp.clone(), (*new_conf).clone());
+                            }
+                            active_config = *new_conf;
+                            *shared_configs.active.lock() = Some(active_config.clone());
+                            for pipeline in &pipelines {
+                                let used_channels = config::used_capture_channels(
+                                    &active_config,
+                                    pipeline.device_group(),
+                                );
+                                pipeline.status().capture.write().used_channels = used_channels;
+                            }
+                            debug!("Sent changes to pipelines");
+                        }
+                        config::ConfigChange::Devices => {
+                            debug!("Devices changed, restart required.");
+                            stop_all_pipelines(&mut pipelines);
+                            *shared_configs.active.lock() = Some(*new_conf);
+                            trace!("All threads stopped, returning");
+                            return Ok(ExitState::Restart);
+                        }
+                        config::ConfigChange::None => {
+                            debug!("No changes in config.");
+                        }
+                    };
+                }
+                Ok(ControllerMessage::Stop) => {
+                    debug!("Stop requested...");
+                    stop_all_pipelines(&mut pipelines);
+                    {
+                        let mut active_cfg_shared = shared_configs.active.lock();
+                        let mut prev_cfg_shared = shared_configs.previous.lock();
+                        *active_cfg_shared = None;
+                        *prev_cfg_shared = Some(active_config);
+                    }
+                    trace!("All threads stopped, stopping");
+                    return Ok(ExitState::Restart);
+                }
+                Ok(ControllerMessage::Exit) => {
+                    debug!("Exit requested...");
+                    stop_all_pipelines(&mut pipelines);
+                    *shared_configs.previous.lock() = Some(active_config);
+                    trace!("All threads stopped, exiting");
+                    return Ok(ExitState::Exit);
+                }
+                Err(err) => {
+                    return Err(Box::new(err));
                 }
             },
-            recv(rx_status) -> msg => {
+            SupervisorEvent::Status(group, msg) => {
                 /// local shortcut for bailing out with fail_and_restart()
                 macro_rules! fail_and_restart {
                     ($stop_reason:expr) => {
                         return fail_and_restart(
-                            pipeline,
-                            is_starting,
                             $stop_reason,
                             active_config,
                             &shared_configs,
                             &status_structs,
+                            &mut pipelines,
                         );
                     };
                 }
@@ -192,38 +269,45 @@ pub fn run(
                 match msg {
                     Ok(msg) => match msg {
                         StatusMessage::PlaybackReady => {
-                            debug!("Playback thread ready to start");
-                            pipeline.set_playback_ready();
-                            if pipeline.release_barrier_if_ready() {
-                                is_starting = false;
-                            }
+                            debug!("Playback thread for group {group} ready to start");
+                            pipelines[group].set_playback_ready();
+                            note_group_ready(
+                                group,
+                                &mut pipelines,
+                                &mut is_starting,
+                                &status_structs,
+                            );
                         }
                         StatusMessage::CaptureReady => {
-                            debug!("Capture thread ready to start");
-                            pipeline.set_capture_ready();
-                            if pipeline.release_barrier_if_ready() {
-                                is_starting = false;
-                                crate::set_stop_reason(&status_structs.status, StopReason::None);
-                            }
+                            debug!("Capture thread for group {group} ready to start");
+                            pipelines[group].set_capture_ready();
+                            note_group_ready(
+                                group,
+                                &mut pipelines,
+                                &mut is_starting,
+                                &status_structs,
+                            );
                         }
                         StatusMessage::PlaybackError(message) => {
-                            error!("Playback error: {message}");
+                            error!("Playback error (group {group}): {message}");
                             fail_and_restart!(StopReason::PlaybackError(message));
                         }
                         StatusMessage::CaptureError(message) => {
-                            error!("Capture error: {message}");
+                            error!("Capture error (group {group}): {message}");
                             fail_and_restart!(StopReason::CaptureError(message));
                         }
                         StatusMessage::PlaybackFormatChange(rate) => {
-                            error!("Playback stopped due to external format change");
+                            error!(
+                                "Playback stopped due to external format change (group {group})"
+                            );
                             fail_and_restart!(StopReason::PlaybackFormatChange(rate));
                         }
                         StatusMessage::CaptureFormatChange(rate) => {
-                            error!("Capture stopped due to external format change");
+                            error!("Capture stopped due to external format change (group {group})");
                             fail_and_restart!(StopReason::CaptureFormatChange(rate));
                         }
                         StatusMessage::PlaybackDone => {
-                            info!("Playback finished");
+                            info!("Playback finished (group {group})");
                             {
                                 let stat = status_structs.status.upgradable_read();
                                 if stat.stop_reason == StopReason::None {
@@ -239,40 +323,37 @@ pub fn run(
                                 *active_cfg_shared = None;
                                 *prev_cfg_shared = Some(active_config);
                             }
-                            pipeline.stop(is_starting);
+                            stop_all_pipelines(&mut pipelines);
                             trace!("All threads stopped, returning");
                             return Ok(ExitState::Restart);
                         }
                         StatusMessage::CaptureDone => {
-                            info!("Capture finished");
+                            info!("Capture finished (group {group})");
                         }
                         StatusMessage::SetSpeed(speed) => {
-                            debug!("SetSpeed message received");
-                            pipeline.send_capture_command(CommandMessage::SetSpeed { speed });
+                            debug!("SetSpeed message received (group {group})");
+                            pipelines[group]
+                                .send_capture_command(CommandMessage::SetSpeed { speed });
                         }
                         StatusMessage::SetVolume(vol) => {
-                            debug!("SetVolume message to  {vol} dB received");
-                            status_structs.processing.set_target_volume(0, vol);
+                            debug!("SetVolume message to {vol} dB received (group {group})");
+                            pipelines[group]
+                                .status()
+                                .processing
+                                .set_target_volume(0, vol);
                         }
                         StatusMessage::SetMute(mute) => {
-                            debug!("SetMute message to {mute} received");
-                            status_structs.processing.set_mute(0, mute);
+                            debug!("SetMute message to {mute} received (group {group})");
+                            pipelines[group].status().processing.set_mute(0, mute);
                         }
                     },
                     Err(err) => {
-                        warn!("Capture, Playback and Processing threads have exited: {err}");
-                        crate::set_stop_reason(
-                            &status_structs.status,
-                            StopReason::UnknownError(
-                                "Capture, Playback and Processing threads have exited"
-                                    .to_string(),
-                            ),
+                        warn!(
+                            "Capture, Playback and Processing threads of group {group} have exited: {err}"
                         );
-                        crate::set_capture_state(
-                            &status_structs.capture,
-                            ProcessingState::Inactive,
-                        );
-                        return Ok(ExitState::Restart);
+                        fail_and_restart!(StopReason::UnknownError(
+                            "Capture, Playback and Processing threads have exited".to_string(),
+                        ));
                     }
                 }
             }
